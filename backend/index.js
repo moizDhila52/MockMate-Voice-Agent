@@ -6,25 +6,23 @@ const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
 const multer = require('multer');
-const { createClient } = require("@deepgram/sdk"); // Import Deepgram
+const { createClient } = require("@deepgram/sdk"); 
 const Groq = require('groq-sdk'); 
 const fs = require('fs');
 
 const app = express();
 const upload = multer({ dest: 'uploads/' }); 
-const port = process.env.PORT || 3000; // Use Render's port or 3000 locally
+const port = process.env.PORT || 3000; 
 
-// Allow requests from anywhere (simplest for Hackathon)
-app.use(cors({
-    origin: '*', 
-    methods: ['GET', 'POST']
-}));
+// Allow requests from anywhere
+app.use(cors({ origin: '*', methods: ['GET', 'POST'] }));
 app.use(express.json());
 
 // Initialize Clients
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
 
+// --- MAIN ROUTE: PROCESS INTERVIEW ---
 app.post('/api/process-interview', upload.single('audio'), async (req, res) => {
   try {
     const audioFile = req.file; 
@@ -33,38 +31,26 @@ app.post('/api/process-interview', upload.single('audio'), async (req, res) => {
 
     console.log("1. Audio received:", audioFile.path);
 
-    // ---------------------------------------------------------
-    // A. TRANSCRIBE AUDIO (DEEPGRAM) - THE NEW PART
-    // ---------------------------------------------------------
-    // We read the file from the hard drive and send it to Deepgram
+    // 1. TRANSCRIBE AUDIO (DEEPGRAM)
+    const fileBuffer = fs.readFileSync(audioFile.path);
     const { result, error } = await deepgram.listen.prerecorded.transcribeFile(
-        fs.readFileSync(audioFile.path),
-        {
-            model: "nova-2", // Their fastest/smartest model
-            smart_format: true,
-            mimetype: audioFile.mimetype,
-        }
+        fileBuffer,
+        { model: "nova-2", smart_format: true, mimetype: "audio/webm" }
     );
 
     if (error) throw error;
-
-    // Extract the text from the messy JSON response
-    const userText = result.results.channels[0].alternatives[0].transcript;
+    const userText = result?.results?.channels[0]?.alternatives[0]?.transcript;
     
-    // Fallback if audio was silent
-    if (!userText) {
+    if (!userText || userText.trim().length === 0) {
         return res.json({ 
             userText: "(Silence)", 
-            aiText: "I didn't hear anything. Could you please repeat that?", 
+            aiText: "I couldn't hear any audio. Please try speaking louder.", 
             audio: null 
         });
     }
-
     console.log("2. Transcription:", userText);
 
-    // ---------------------------------------------------------
-    // B. GET AI RESPONSE (GROQ)
-    // ---------------------------------------------------------
+    // 2. GET AI RESPONSE (GROQ)
     const messages = [
       { role: "system", content: "You are a strict interviewer. Keep answers concise (max 2 sentences)." },
       ...chatHistory,
@@ -73,7 +59,7 @@ app.post('/api/process-interview', upload.single('audio'), async (req, res) => {
 
     const completion = await groq.chat.completions.create({
       messages: messages,
-      model: "llama-3.1-8b-instant", // The fast model
+      model: "llama-3.1-8b-instant",
       temperature: 0.5,
       max_tokens: 100, 
     });
@@ -82,67 +68,102 @@ app.post('/api/process-interview', upload.single('audio'), async (req, res) => {
     console.log("3. AI Response:", aiText);
 
     // ---------------------------------------------------------
-    // C. GENERATE VOICE (MURF)
+    // 3. GENERATE VOICE (MURF FALCON STREAMING - EXACT SNIPPET INTEGRATION)
     // ---------------------------------------------------------
-    const murfResponse = await axios.post('https://api.murf.ai/v1/speech/generate', {
-      voiceId: 'en-US-natalie', 
+    console.log("🔊 Generating Audio with Falcon Stream (Natalie)...");
+
+    const murfUrl = 'https://global.api.murf.ai/v1/speech/stream'; // The Streaming Endpoint
+    
+    // Configuration from your provided snippet
+    const streamData = {
+      voiceId: "en-US-natalie", // Using Natalie as requested
+      style: "Promo",           // Required for Natalie on Falcon
       text: aiText,
-      format: 'MP3'
-    }, {
-      headers: { 'api-key': process.env.MURF_API_KEY }
+      multiNativeLocale: "en-US",
+      model: "FALCON",
+      format: "MP3",
+      sampleRate: 24000,
+      channelType: "MONO"
+    };
+
+    const streamConfig = {
+      method: 'post',
+      url: murfUrl,
+      headers: {
+        'Content-Type': 'application/json',
+        'api-key': process.env.MURF_API_KEY
+      },
+      data: streamData,
+      responseType: 'stream', // Critical for receiving chunks
+      validateStatus: () => true // Prevent immediate crash on 4xx/5xx
+    };
+
+    // We wrap the stream logic in a Promise to await the full Base64 string
+    const audioDataURI = await new Promise((resolve, reject) => {
+        axios(streamConfig)
+            .then((response) => {
+                // If the API returns an error (like 403), reject immediately
+                if (response.status >= 400) {
+                    console.error(`Murf API Error: ${response.status} ${response.statusText}`);
+                    // We try to read the error message from the stream
+                    response.data.on('data', (chunk) => console.error("Error Details:", chunk.toString()));
+                    return reject(new Error(`Murf API Error: ${response.status}`));
+                }
+
+                const chunks = [];
+                
+                // Collect audio chunks as they arrive
+                response.data.on('data', (chunk) => {
+                    chunks.push(chunk);
+                });
+
+                // When stream ends, combine chunks and convert to Base64
+                response.data.on('end', () => {
+                    console.log('Stream ended. Audio ready.');
+                    const audioBuffer = Buffer.concat(chunks);
+                    const base64Audio = audioBuffer.toString('base64');
+                    // Create a Data URI that the frontend can play immediately
+                    resolve(`data:audio/mp3;base64,${base64Audio}`);
+                });
+
+                response.data.on('error', (err) => reject(err));
+            })
+            .catch((error) => {
+                console.error("Axios Request Failed:", error.message);
+                reject(error);
+            });
     });
 
-    // ---------------------------------------------------------
-    // D. SEND RESPONSE
-    // ---------------------------------------------------------
+    // 4. SEND RESPONSE
     res.json({
       userText: userText,
       aiText: aiText,
-      audio: murfResponse.data.audioFile 
+      audio: audioDataURI
     });
 
-    // Cleanup: Delete the temp file to save space
-    fs.unlinkSync(audioFile.path);
+    if (fs.existsSync(audioFile.path)) fs.unlinkSync(audioFile.path);
 
   } catch (error) {
-    console.error("Error processing interview:", error);
+    console.error("❌ Error processing interview:", error.message);
     res.status(500).send("Error processing interview");
   }
 });
 
-// Route to Grade the Interview
+// --- ROUTE: GENERATE SCORE ---
 app.post('/api/generate-score', async (req, res) => {
   try {
     const { history } = req.body;
     const chatHistory = JSON.parse(history || '[]');
-
-    // System Prompt to force Groq to be a Grader
-    const systemPrompt = `
-      You are an expert interviewer. Analyze the following interview conversation.
-      Return a JSON object (NO MARKDOWN, ONLY JSON) with this exact structure:
-      {
-        "technical": (score out of 10),
-        "communication": (score out of 10),
-        "clarity": (score out of 10),
-        "feedback": "A short summary (max 2 sentences) of the candidate's performance."
-      }
-    `;
-
-    const messages = [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: `Here is the conversation history: ${JSON.stringify(chatHistory)}` }
-    ];
-
+    const systemPrompt = `You are an expert interviewer. Analyze the conversation. Return JSON: { "technical": (0-10), "communication": (0-10), "clarity": (0-10), "feedback": "Short summary." }`;
+    
     const completion = await groq.chat.completions.create({
-      messages: messages,
+      messages: [{ role: "system", content: systemPrompt }, { role: "user", content: JSON.stringify(chatHistory) }],
       model: "llama-3.1-8b-instant",
-      temperature: 0.2, // Low temp for consistent JSON
-      response_format: { type: "json_object" } // Force JSON mode
+      temperature: 0.2,
+      response_format: { type: "json_object" }
     });
 
-    const scoreData = JSON.parse(completion.choices[0].message.content);
-    res.json(scoreData);
-
+    res.json(JSON.parse(completion.choices[0].message.content));
   } catch (error) {
     console.error("Scoring Error:", error);
     res.status(500).json({ error: "Failed to generate score" });
