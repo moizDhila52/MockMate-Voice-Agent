@@ -44,7 +44,7 @@ const Interview = () => {
       formData.append("history", JSON.stringify(chatHistory));
 
       const response = await axios.post(
-        "http://localhost:3000/api/process-interview",
+       ${import.meta.env.VITE_API_URL}/api/process-interview,
         formData,
         { headers: { "Content-Type": "multipart/form-data" } }
       );
@@ -90,7 +90,7 @@ const Interview = () => {
     setIsProcessing(true);
     try {
       const response = await axios.post(
-        "http://localhost:3000/api/generate-score",
+        ${import.meta.env.VITE_API_URL}/api/generate-score,
         { history: JSON.stringify(chatHistory) }
       );
       navigate("/score", { state: response.data });
